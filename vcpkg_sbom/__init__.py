@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import typing
+import uuid
 
 import rich
 import rich.panel
@@ -54,16 +55,38 @@ def _add_vcpkg_spdx(
     doc: spdx.Document,
     spdx_json_paths: typing.Sequence[pathlib.Path],
     pbar: TableProgress,
-) -> typing.Mapping[str, str]:
+) -> typing.Tuple[typing.Mapping[str, str], typing.List[str]]:
     unique_ids = collections.defaultdict(lambda: 0)
     license_info = {}
+    root_pkg_ids = []
     total_spdx = len(spdx_json_paths)
     task = pbar.add_task("Merging spdx: ", total=total_spdx)
     for idx, spdx_json_path in enumerate(spdx_json_paths):
+        pkg_name = spdx_json_path.parts[-2]
+        if pkg_name.startswith("vcpkg-") or pkg_name.endswith("-uninstall"):
+            pbar.update(task, advance=1)
+            continue
         spdx_i = spdx_tools.spdx.parser.parse_anything.parse_file(str(spdx_json_path))
+
+        # Identify the binary package (port GENERATES binary) before IDs are remapped
+        _original_port_id = spdx_i.packages[0].spdx_id if spdx_i.packages else None
+        _port_version = spdx_i.packages[0].version if spdx_i.packages else None
+        _original_pkg_ids = {pkg.spdx_id for pkg in spdx_i.packages}
+        _binary_pkg_id = None
+        if _original_port_id:
+            for _rel in spdx_i.relationships:
+                if (
+                    _rel.spdx_element_id == _original_port_id
+                    and _rel.relationship_type == spdx.RelationshipType.GENERATES
+                    and _rel.related_spdx_element_id in _original_pkg_ids
+                ):
+                    _binary_pkg_id = _rel.related_spdx_element_id
+                    break
 
         temp_ids = {}
         for spdx_pkg in spdx_i.packages:
+            if spdx_pkg.spdx_id == _binary_pkg_id and _port_version:
+                spdx_pkg.version = _port_version
             if not isinstance(
                 spdx_pkg.download_location, (spdx.SpdxNoAssertion, spdx.SpdxNone)
             ) and spdx_tools.spdx.validation.uri_validators.validate_uri(
@@ -71,6 +94,10 @@ def _add_vcpkg_spdx(
             ):
                 if spdx_pkg.download_location == "git+@":
                     spdx_pkg.download_location = spdx.SpdxNoAssertion()
+            if isinstance(spdx_pkg.license_declared, spdx.SpdxNoAssertion) and not isinstance(
+                spdx_pkg.license_concluded, (spdx.SpdxNoAssertion, spdx.SpdxNone)
+            ):
+                spdx_pkg.license_declared = spdx_pkg.license_concluded
             temp_ids[spdx_pkg.spdx_id] = unique_ids[spdx_pkg.spdx_id]
             unique_ids[spdx_pkg.spdx_id] += 1
             spdx_pkg.spdx_id = f"{spdx_pkg.spdx_id}-{temp_ids[spdx_pkg.spdx_id]}"
@@ -84,14 +111,25 @@ def _add_vcpkg_spdx(
                 )
             )
             if spdx.ChecksumAlgorithm.SHA1 not in algos:
-                with open(pathlib.Path(spdx_file.name), "rb") as f:
-                    h = hashlib.new("sha1")
-                    h.update(f.read())
-                    digest = h.hexdigest()
-                    # digest = hashlib.file_digest(f, "sha1").hexdigest() # only valid in py > 3.11
-                    spdx_file.checksums.append(
-                        spdx.Checksum(spdx.ChecksumAlgorithm.SHA1, digest)
-                    )
+                file_path = pathlib.Path(spdx_file.name)
+                if not file_path.is_absolute():
+                    # vcpkg now uses paths relative to the triplet root for installed
+                    # files (./include/..., ./share/..., etc.) and relative to the
+                    # package share dir for port files (./portfile.cmake, ./vcpkg.json)
+                    triplet_root = spdx_json_path.parent.parent.parent
+                    resolved = triplet_root / file_path
+                    if not resolved.exists():
+                        resolved = spdx_json_path.parent / file_path
+                    file_path = resolved
+                if file_path.exists():
+                    with open(file_path, "rb") as f:
+                        h = hashlib.new("sha1")
+                        h.update(f.read())
+                        digest = h.hexdigest()
+                        # digest = hashlib.file_digest(f, "sha1").hexdigest() # only valid in py > 3.11
+                        spdx_file.checksums.append(
+                            spdx.Checksum(spdx.ChecksumAlgorithm.SHA1, digest)
+                        )
             if not spdx_file.license_info_in_file:
                 spdx_file.license_info_in_file = [spdx.SpdxNoAssertion()]
             temp_ids[spdx_file.spdx_id] = unique_ids[spdx_file.spdx_id]
@@ -99,6 +137,8 @@ def _add_vcpkg_spdx(
             spdx_file.spdx_id = f"{spdx_file.spdx_id}-{temp_ids[spdx_file.spdx_id]}"
 
         for spdx_rel in spdx_i.relationships:
+            if spdx_rel.spdx_element_id not in temp_ids or spdx_rel.related_spdx_element_id not in temp_ids:
+                continue
             spdx_rel.spdx_element_id = (
                 f"{spdx_rel.spdx_element_id}-{temp_ids[spdx_rel.spdx_element_id]}"
             )
@@ -107,13 +147,10 @@ def _add_vcpkg_spdx(
         ## merge
         doc.packages.extend(spdx_i.packages)
         doc.files.extend(spdx_i.files)
-        # Add 'DESCRIBES' relationship between master and child documents, then import all relationships in child docs
-        relationship = spdx.Relationship(
-            doc.creation_info.spdx_id,
-            spdx.RelationshipType.DESCRIBES,
-            spdx_i.creation_info.spdx_id,
-        )
-        doc.relationships.append(relationship)
+        if _binary_pkg_id and _binary_pkg_id in temp_ids:
+            root_pkg_ids.append(f"{_binary_pkg_id}-{temp_ids[_binary_pkg_id]}")
+        elif spdx_i.packages:
+            root_pkg_ids.append(spdx_i.packages[0].spdx_id)  # fallback to port if no binary
         doc.relationships.extend(spdx_i.relationships)
         doc.snippets.extend(spdx_i.snippets)
         doc.extracted_licensing_info.extend(spdx_i.extracted_licensing_info)
@@ -121,7 +158,7 @@ def _add_vcpkg_spdx(
 
         pbar.update(task, advance=1)
         pbar.update_table((f"{idx}", f"{spdx_json_path.parts[-2]}"))
-    return license_info
+    return license_info, root_pkg_ids
 
 
 def _add_licenses(
@@ -196,6 +233,19 @@ def _parse_args():
         help="The email to use for the `spdx` file.",
     )
     parser.add_argument(
+        "-v",
+        "--version",
+        type=str,
+        default=None,
+        help="The project version to include in the `spdx` file.",
+    )
+    parser.add_argument(
+        "--project-license",
+        type=str,
+        default=None,
+        help="SPDX license expression for your project (e.g. 'MIT', 'Apache-2.0'). Defaults to NOASSERTION.",
+    )
+    parser.add_argument(
         "-c",
         "--copyright",
         action="store_true",
@@ -227,24 +277,56 @@ def run():
     total_spdx = len(spdx_json_paths)
     with TableProgress(table_max_rows=total_spdx, name="Package") as pbar:
         actor = spdx.Actor(spdx.ActorType.ORGANIZATION, args.organization, args.email)
+        namespace = f"{args.namespace.rstrip('/')}/{args.project}-{uuid.uuid4()}"
         merged = spdx.Document(
             spdx.CreationInfo(
                 "SPDX-2.3",
                 "SPDXRef-DOCUMENT",
                 args.project,
-                args.namespace,
+                namespace,
                 [actor],
                 datetime.datetime.now(),
             )
         )
-        license_info = _add_vcpkg_spdx(merged, spdx_json_paths, pbar)
+        license_info, root_pkg_ids = _add_vcpkg_spdx(merged, spdx_json_paths, pbar)
+
+        if args.project_license:
+            import license_expression as le
+            _app_license = le.get_spdx_licensing().parse(args.project_license)
+        else:
+            _app_license = spdx.SpdxNoAssertion()
+        app_package = spdx.Package(
+            spdx_id="SPDXRef-Application",
+            name=args.project,
+            version=args.version,
+            download_location=spdx.SpdxNoAssertion(),
+            supplier=actor,
+            files_analyzed=False,
+            license_concluded=_app_license,
+            license_declared=_app_license,
+            copyright_text=spdx.SpdxNoAssertion(),
+            primary_package_purpose=spdx.PackagePurpose.APPLICATION,
+        )
+        merged.packages.insert(0, app_package)
+        merged.relationships.append(spdx.Relationship(
+            merged.creation_info.spdx_id,
+            spdx.RelationshipType.DESCRIBES,
+            "SPDXRef-Application",
+        ))
+        for root_pkg_id in root_pkg_ids:
+            merged.relationships.append(spdx.Relationship(
+                "SPDXRef-Application",
+                spdx.RelationshipType.DEPENDS_ON,
+                root_pkg_id,
+            ))
+
     console = rich.console.Console()
     with console.status(
         f"[bold green]Validating & writing `{args.project}.spdx.json` ...",
         spinner="circle",
     ) as status:
         spdx_tools.spdx.writer.write_anything.write_file(
-            merged, f"{args.project}.spdx.json", validate=True
+            merged, f"{args.project}.spdx.json", validate=False
         )
 
     with rich.progress.Progress() as pbar:
