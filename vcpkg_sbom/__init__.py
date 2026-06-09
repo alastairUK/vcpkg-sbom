@@ -103,6 +103,7 @@ def _add_vcpkg_spdx(
             spdx_pkg.spdx_id = f"{spdx_pkg.spdx_id}-{temp_ids[spdx_pkg.spdx_id]}"
             license_info[spdx_pkg.name] = str(spdx_pkg.license_concluded)
 
+        files_to_merge = []
         for spdx_file in spdx_i.files:
             algos = set(
                 toolz.map(
@@ -121,21 +122,27 @@ def _add_vcpkg_spdx(
                     if not resolved.exists():
                         resolved = spdx_json_path.parent / file_path
                     file_path = resolved
-                if file_path.exists():
-                    with open(file_path, "rb") as f:
-                        h = hashlib.new("sha1")
-                        h.update(f.read())
-                        digest = h.hexdigest()
-                        # digest = hashlib.file_digest(f, "sha1").hexdigest() # only valid in py > 3.11
-                        spdx_file.checksums.append(
-                            spdx.Checksum(spdx.ChecksumAlgorithm.SHA1, digest)
-                        )
+                if not file_path.exists():
+                    # Can't compute required SHA1 (file not in vcpkg_installed —
+                    # e.g. portfile.cmake, vcpkg.json, patch files live in vcpkg ports dir).
+                    # Exclude entirely; the relationship guard on temp_ids drops CONTAINS too.
+                    continue
+                with open(file_path, "rb") as f:
+                    h = hashlib.new("sha1")
+                    h.update(f.read())
+                    digest = h.hexdigest()
+                    # digest = hashlib.file_digest(f, "sha1").hexdigest() # only valid in py > 3.11
+                    spdx_file.checksums.append(
+                        spdx.Checksum(spdx.ChecksumAlgorithm.SHA1, digest)
+                    )
             if not spdx_file.license_info_in_file:
                 spdx_file.license_info_in_file = [spdx.SpdxNoAssertion()]
             temp_ids[spdx_file.spdx_id] = unique_ids[spdx_file.spdx_id]
             unique_ids[spdx_file.spdx_id] += 1
             spdx_file.spdx_id = f"{spdx_file.spdx_id}-{temp_ids[spdx_file.spdx_id]}"
+            files_to_merge.append(spdx_file)
 
+        rels_to_merge = []
         for spdx_rel in spdx_i.relationships:
             if spdx_rel.spdx_element_id not in temp_ids or spdx_rel.related_spdx_element_id not in temp_ids:
                 continue
@@ -143,15 +150,16 @@ def _add_vcpkg_spdx(
                 f"{spdx_rel.spdx_element_id}-{temp_ids[spdx_rel.spdx_element_id]}"
             )
             spdx_rel.related_spdx_element_id = f"{spdx_rel.related_spdx_element_id}-{temp_ids[spdx_rel.related_spdx_element_id]}"
+            rels_to_merge.append(spdx_rel)
 
         ## merge
         doc.packages.extend(spdx_i.packages)
-        doc.files.extend(spdx_i.files)
+        doc.files.extend(files_to_merge)
         if _binary_pkg_id and _binary_pkg_id in temp_ids:
             root_pkg_ids.append(f"{_binary_pkg_id}-{temp_ids[_binary_pkg_id]}")
         elif spdx_i.packages:
             root_pkg_ids.append(spdx_i.packages[0].spdx_id)  # fallback to port if no binary
-        doc.relationships.extend(spdx_i.relationships)
+        doc.relationships.extend(rels_to_merge)
         doc.snippets.extend(spdx_i.snippets)
         doc.extracted_licensing_info.extend(spdx_i.extracted_licensing_info)
         doc.annotations.extend(spdx_i.annotations)
